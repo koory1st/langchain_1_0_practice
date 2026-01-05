@@ -1,103 +1,114 @@
-from dotenv import load_dotenv
-import os
-
-from langchain_community.embeddings import MiniMaxEmbeddings
-
-from langchain.agents import create_agent
-from langchain.agents.middleware import before_model, after_model,AgentState
-
-load_dotenv(override=True)
-
-MINIMAX_API_KEY = os.getenv("MINIMAX_API_KEY")
-LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY")
-
-from langchain_community.document_loaders import PyPDFLoader
-
-embeddings = MiniMaxEmbeddings()
-
-# 对话模型
 from langchain_deepseek import ChatDeepSeek
 from dotenv import load_dotenv
 import os
 
-from langchain.agents import create_agent
-from langchain.agents.middleware import before_model, after_model,AgentState
-
 load_dotenv(override=True)
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
+
 model = ChatDeepSeek(
     model="deepseek-chat",
     temperature=0,
     max_tokens=None,
     timeout=None,
     max_retries=2,
+    api_key=DEEPSEEK_API_KEY,
     # other params...
 )
 
-import bs4
-from langchain_community.document_loaders import WebBaseLoader
-
-# Only keep post title, headers, and content from the full HTML.
-bs4_strainer = bs4.SoupStrainer(class_=("post-title", "post-header", "post-content"))
-loader = WebBaseLoader(
-    web_paths=("https://lilianweng.github.io/posts/2023-06-23-agent/",),
-    bs_kwargs={"parse_only": bs4_strainer},
-)
-docs = loader.load()
-
-assert len(docs) == 1
-print(f"Total characters: {len(docs[0].page_content)}")
-
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=1000,  # chunk size (characters)
-    chunk_overlap=200,  # chunk overlap (characters)
-    add_start_index=True,  # track index in original document
-)
-all_splits = text_splitter.split_documents(docs)
-
-print(f"Split blog post into {len(all_splits)} sub-documents.")
-
-
-from langchain_core.vectorstores import InMemoryVectorStore
-
-vector_store = InMemoryVectorStore(embeddings)
-document_ids = vector_store.add_documents(documents=all_splits)
-
-print(document_ids[:3])
 
 from langchain.tools import tool
+# Define tools
+@tool
+def multiply(a: int, b: int) -> int:
+    """Multiply `a` and `b`.
 
-@tool(response_format="content_and_artifact")
-def retrieve_context(query: str):
-    """Retrieve information to help answer a query."""
-    retrieved_docs = vector_store.similarity_search(query, k=2)
-    serialized = "\n\n".join(
-        (f"Source: {doc.metadata}\nContent: {doc.page_content}")
-        for doc in retrieved_docs
+    Args:
+        a: First int
+        b: Second int
+    """
+    return a * b
+
+
+@tool
+def add(a: int, b: int) -> int:
+    """Adds `a` and `b`.
+
+    Args:
+        a: First int
+        b: Second int
+    """
+    return a + b
+
+
+@tool
+def divide(a: int, b: int) -> float:
+    """Divide `a` and `b`.
+
+    Args:
+        a: First int
+        b: Second int
+    """
+    return a / b
+
+
+# Augment the LLM with tools
+tools = [add, multiply, divide]
+tools_by_name = {tool.name: tool for tool in tools}
+model_with_tools = model.bind_tools(tools)
+
+from langgraph.graph import add_messages
+from langchain.messages import (
+    SystemMessage,
+    HumanMessage,
+    ToolCall,
+)
+from langchain_core.messages import BaseMessage
+from langgraph.func import entrypoint, task
+
+@task
+def call_llm(messages: list[BaseMessage]):
+    """LLM decides whether to call a tool or not"""
+    a=        [
+            SystemMessage(
+                content="You are a helpful assistant tasked with performing arithmetic on a set of inputs."
+            )
+        ]
+
+    b =messages
+    c=a+b
+    ret = model_with_tools.invoke(
+        c
     )
-    return serialized, retrieved_docs
+    return ret
 
-from langchain.agents import create_agent
+@task
+def call_tool(tool_call: ToolCall):
+    """Performs the tool call"""
+    tool = tools_by_name[tool_call["name"]]
+    return tool.invoke(tool_call)
 
+@entrypoint()
+def agent(messages: list[BaseMessage]):
+    model_response = call_llm(messages).result()
 
-tools = [retrieve_context]
-# If desired, specify custom instructions
-prompt = (
-    "You have access to a tool that retrieves context from a blog post. "
-    "Use the tool to help answer user queries."
-)
-agent = create_agent(model, tools, system_prompt=prompt)
+    while True:
+        if not model_response.tool_calls:
+            break
 
-query = (
-    "What is the standard method for Task Decomposition?\n\n"
-    "Once you get the answer, look up common extensions of that method."
-)
+        # Execute tools
+        tool_result_futures = [
+            call_tool(tool_call) for tool_call in model_response.tool_calls
+        ]
+        tool_results = [fut.result() for fut in tool_result_futures]
+        messages = add_messages(messages, [model_response, *tool_results])
+        model_response = call_llm(messages).result()
 
-for event in agent.stream(
-    {"messages": [{"role": "user", "content": query}]},
-    stream_mode="values",
-):
-    event["messages"][-1].pretty_print()
+    messages = add_messages(messages, model_response)
+    return messages
+
+# Invoke
+messages = [HumanMessage(content="Add 3 and 4.")]
+for chunk in agent.stream(messages, stream_mode="updates"):
+    print(chunk)
+    print("\n")
